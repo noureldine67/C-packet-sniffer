@@ -410,17 +410,45 @@ int main(int argc, char *argv[]) {
     }
 
     if (FD_ISSET(sock, &rfds)) {
-      ssize_t n_bytes = recvfrom(sock, buffer, MAX, 0, NULL, NULL);
+      struct sockaddr_ll from;
+      socklen_t fromlen = sizeof(from);
+      memset(&from, 0, sizeof(from));
+
+      ssize_t n_bytes =
+          recvfrom(sock, buffer, MAX, 0, (struct sockaddr *)&from, &fromlen);
       if (n_bytes == -1) {
         if (errno == EINTR)
           continue;
         perror("recvfrom");
         break;
       }
-      /* Meme en pause, on vide le socket pour ne pas laisser le tampon
-       * noyau se remplir ; on n'affiche simplement rien. */
+
       if (!paused) {
         packet_count++;
+
+        const char *direction;
+        switch (from.sll_pkttype) {
+        case PACKET_HOST:
+          direction = "ENTRANT (pour nous)";
+          break;
+        case PACKET_OUTGOING:
+          direction = "SORTANT";
+          break;
+        case PACKET_BROADCAST:
+          direction = "ENTRANT (broadcast)";
+          break;
+        case PACKET_MULTICAST:
+          direction = "ENTRANT (multicast)";
+          break;
+        case PACKET_OTHERHOST:
+          direction = "ENTRANT (pour un autre hote)";
+          break;
+        default:
+          direction = "direction inconnue";
+          break;
+        }
+        printf("[#%lu] %s\n", packet_count, direction);
+
         print_packet(buffer, n_bytes, packet_count);
       }
     }
