@@ -1,4 +1,3 @@
-```markdown
 # Low-Level Network Packet Sniffer (C & Raw Sockets)
 
 Un sniffer de paquets réseau bas niveau développé en C sous Linux. Ce projet a été réalisé dans un **but exclusivement pédagogique** afin de maîtriser la programmation réseau bas niveau, la manipulation des sockets raw (`AF_PACKET`) et l'analyse directe des structures de données du modèle OSI.
@@ -68,7 +67,3 @@ Exemple : `sudo ./sniffer wlan0` ou `sudo ./sniffer lo`
 ## Avertissement
 
 Projet conçu uniquement dans un cadre d'études et de recherche. L'écoute du trafic sur un réseau sans autorisation est strictement interdite.
-
-```
-
-```
