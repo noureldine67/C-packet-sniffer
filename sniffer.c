@@ -7,20 +7,11 @@
  * (AF_PACKET/SOCK_RAW) lié à cette interface, puis capture en boucle les
  * trames qui y transitent et affiche pour chacune : adresses MAC
  * source/destination, adresses IP source/destination, protocole de
- * transport (TCP ou UDP) avec les ports, et un dump hexadécimal + ASCII
- * des données utiles.
+ * transport (TCP, UDP ou ICMP) avec les détails associés, et un dump
+ * hexadécimal + ASCII des données utiles.
  *
  * Contrôles :
  *   Ctrl+C   quitte proprement (SIGINT, un vrai signal POSIX)
- *   Ctrl+D   met la capture en pause / la relance
- *
- * Important à propos de Ctrl+D : contrairement à Ctrl+C (SIGINT), ce
- * n'est PAS un signal POSIX. C'est un caractère de contrôle interprété
- * par le pilote du terminal : tapé sur une ligne vide, il fait que le
- * prochain read() sur l'entrée standard renvoie 0 (condition de fin de
- * fichier / EOF), sans qu'il soit nécessaire d'appuyer sur Entrée. Ce
- * programme surveille donc stdin avec select() en même temps que le
- * socket, et bascule l'état pause/reprise à chaque EOF détecté.
  *
  * Nécessite les privilèges root (ou CAP_NET_RAW / CAP_NET_ADMIN) : la
  * création du socket raw et la modification des drapeaux de l'interface
@@ -38,6 +29,7 @@
 #include <netinet/if_ether.h>
 #include <netinet/in.h>
 #include <netinet/ip.h>
+#include <netinet/ip_icmp.h>
 #include <netinet/tcp.h>
 #include <netinet/udp.h>
 #include <signal.h>
@@ -49,14 +41,11 @@
 #include <sys/ioctl.h>
 #include <sys/select.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <unistd.h>
 
-#define MAX 65535 /**< Taille max d'une trame lue via recvfrom() */
+#define MAX 65535 /* Taille max d'une trame lue via recvfrom() */
 
-/* Macro robuste : do { ... } while(0) permet une utilisation sûre y
- * compris dans un if/else sans accolades. Les parenthèses autour de (op)
- * évitent les mauvaises surprises si l'expression passée contient un
- * opérateur de priorité inférieure à ==. */
 #define ERROR_CHECK(op)                                                        \
   do {                                                                         \
     if ((op) == -1) {                                                          \
@@ -65,25 +54,10 @@
     }                                                                          \
   } while (0)
 
-/* volatile sig_atomic_t est le seul type dont la lecture/écriture est
- * garantie sûre à la fois dans un gestionnaire de signal et dans le
- * programme principal (contrairement à un simple "volatile int", qui
- * fonctionne en pratique sur la plupart des systèmes mais n'est pas
- * portable au sens strict de la norme C). */
 static volatile sig_atomic_t keepRunning = 1;
 
 /**
  * @brief Gestionnaire du signal SIGINT (Ctrl+C).
- *
- * Se contente de positionner un drapeau : un gestionnaire de signal ne
- * doit appeler que des fonctions "async-signal-safe" au sens POSIX, ce
- * que printf() n'est pas garanti être (elle peut être interrompue en
- * plein milieu d'un autre appel stdio, par exemple si le signal arrive
- * pendant un printf() de print_packet()). L'affichage du message de fin
- * se fait donc dans main(), après la boucle, une fois qu'on est sûr
- * qu'aucun autre appel stdio n'est en cours.
- *
- * @param dummy Numéro du signal reçu (non utilisé).
  */
 void intHandler(int dummy) {
   (void)dummy;
@@ -91,28 +65,35 @@ void intHandler(int dummy) {
 }
 
 /**
+ * @brief Affiche le bandeau ASCII du programme au lancement.
+ */
+static void print_banner(void) {
+  fputs("⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⣠⣄⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀\n"
+        "⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⣠⣾⣿⣿⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀\n"
+        "⠀⠀⠀⠀⠀⠀⠀⠀⢀⣀⣀⣀⣀⣀⡀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⣰⣿⣿⣿⣿⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀\n"
+        "⢠⣾⣿⣏⠉⠉⠉⠉⠉⠉⢡⣶⡀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠘⠻⢿⣿⣿⣿⡀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢀⣤⡄⠀\n"
+        "⠈⣿⣿⣿⣿⣦⣽⣦⡀⠀⠀⠛⠁⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠉⠛⢧⡀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⣠⣿⣿⠀⠀\n"
+        "⠀⠘⢿⣿⣿⣿⣿⣿⣿⣦⣄⣀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢀⣾⣿⣿⠇⠀⠀\n"
+        "⠀⠀⠈⠻⣿⣿⣿⣿⡟⢿⠻⠛⠙⠉⠋⠛⠳⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⣠⣿⣿⣿⡟⠀⠀⠀\n"
+        "⠀⠀⠀⠀⠈⠙⢿⡇⣠⣤⣶⣶⣾⡉⠉⠁⠀⠀⠀⠀⠀⠀⠀⠀⠀⣰⣰⡀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠠⠾⢇⠀⠀⠀⠀⠀⣴⣿⣿⣿⣿⠃⠀⠀⠀\n"
+        "⠀⠀⠀⠀⠀⠀⠀⠱⣿⣿⣿⣿⣿⣿⣦⡀⠀⠀⠀⠀⠀⠀⠀⠀⣰⣿⣿⡇⠀⠀⠀⠀⠀⠀⠀⠀⠀⠐⠤⢤⣀⣀⣀⣀⣀⣀⣠⣤⣤⣤⣬⣭⣿⣿⠀⠀⠀⠀\n"
+        "⠀⠀⠀⠀⠀⠀⠀⠀⠈⠛⢿⣿⣿⣿⣿⣿⣶⣤⣄⣀⣀⣠⣴⣾⣿⣿⣿⣷⣤⣀⡀⠀⠀⠀⠀⠀⠀⣀⣀⣤⣾⣿⣿⣿⣿⡿⠿⠛⠛⠻⣿⣿⣿⣿⣇⠀⠀⠀\n"
+        "⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠈⠙⠻⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣶⣶⣤⣤⣘⡛⠿⢿⡿⠟⠛⠉⠁⠀⠀⠀⠀⠀⠈⠻⣿⣿⣿⣦⠀⠀\n"
+        "⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⣴⣾⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⠿⢿⣿⣿⣿⣿⣿⣶⣦⣤⣀⡀⠀⠀⠀⠀⠀⠀⠀⠀⠈⠻⣿⣿⡄⠀\n"
+        "⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢠⣾⣿⣿⣿⠿⠛⠉⠁⠀⠈⠉⠙⠛⠛⠻⠿⠿⠿⠿⠟⠛⠃⠀⠀⠀⠉⠉⠉⠛⠛⠛⠿⠿⠿⣶⣦⣄⡀⠀⠀⠀⠀⠀⠈⠙⠛⠂\n"
+        "⠀⠀⠀⠀⠀⠀⠀⠀⠀⠠⠿⠛⠋⠁⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠉⠉⠁⠀⠀⠀⠀⠀⠀⠀⠀\n",
+        stdout);
+  fflush(stdout);
+}
+
+/**
  * @brief Restaure les drapeaux d'origine d'une interface réseau.
- *
- * Annule l'activation de IFF_PROMISC faite par set_promiscuous_socket().
- * Sans cette étape, l'interface resterait en mode promiscuous pour tout
- * le système (visible via `ip link show`, et affectant potentiellement
- * d'autres logiciels) même après la fin de ce programme -- c'est un bug
- * réel de la version précédente, qui ne remettait jamais les drapeaux
- * en place.
- *
- * Fonction "best effort" : en cas d'échec, on avertit l'utilisateur avec
- * la commande manuelle de secours plutôt que de faire planter le
- * programme pendant sa phase de nettoyage.
- *
- * @param sock        Socket déjà lié à l'interface (utilisé pour l'ioctl).
- * @param iface_name  Nom de l'interface (ex : "wlan0").
- * @param original_flags Drapeaux à restaurer, tels que sauvegardés par
- *                        set_promiscuous_socket().
  */
 void restore_interface_flags(int sock, const char *iface_name,
                              short original_flags) {
   struct ifreq ifr;
   memset(&ifr, 0, sizeof(ifr));
+  snprintf(ifr.ifr_name, IFNAMSIZ, "%s", iface_name);
   strncpy(ifr.ifr_name, iface_name, IFNAMSIZ - 1);
   ifr.ifr_flags = original_flags;
 
@@ -121,25 +102,6 @@ void restore_interface_flags(int sock, const char *iface_name,
 
 /**
  * @brief Crée un socket raw et active le mode promiscuous sur l'interface.
- *
- * Étapes : création du socket AF_PACKET/SOCK_RAW (ETH_P_ALL), lecture des
- * drapeaux actuels de l'interface (SIOCGIFFLAGS, sauvegardés dans
- * *original_flags pour restauration ultérieure), ajout du drapeau
- * IFF_PROMISC (SIOCSIFFLAGS), résolution de l'index de l'interface, puis
- * liaison (bind) du socket dessus.
- *
- * Notez la différence avec l'autre méthode classique (setsockopt avec
- * PACKET_ADD_MEMBERSHIP) : celle-ci modifie l'état du socket uniquement,
- * et le mode promiscuous est automatiquement désactivé à la fermeture du
- * socket. Ici, on modifie l'état de l'interface elle-même (visible par
- * tout le système), d'où la nécessité de le restaurer explicitement.
- *
- * @param iface_name      Nom de l'interface à écouter (ex : "wlan0").
- * @param original_flags  [out] reçoit les drapeaux d'origine de
- *                         l'interface, à conserver pour
- * restore_interface_flags().
- * @return Le descripteur de socket, ou -1 en cas d'erreur (message déjà
- *         affiché via perror/fprintf).
  */
 int set_promiscuous_socket(const char *iface_name, short *original_flags) {
   int sock;
@@ -176,47 +138,33 @@ int set_promiscuous_socket(const char *iface_name, short *original_flags) {
     return -1;
   }
 
+  /* Configuration d'un timeout de 1s sur recvfrom() pour débloquer Ctrl+C */
+  struct timeval tv;
+  tv.tv_sec = 1;
+  tv.tv_usec = 0;
+  setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char *)&tv, sizeof(tv));
+
   return sock;
 }
 
 /**
- * @brief Décode et affiche un paquet capturé (Ethernet/IP/TCP ou UDP).
- *
- * Affiche les adresses MAC, puis si la trame est de l'IPv4, les adresses
- * IP, le protocole de transport avec les ports (TCP avec ses flags, ou
- * UDP), et enfin un dump hexadécimal + ASCII des données utiles.
- *
- * Chaque étape vérifie que @p n_bytes est suffisant AVANT de déréférencer
- * l'en-tête correspondant. C'est essentiel : la version précédente
- * supposait que chaque trame était forcément de l'IPv4 en TCP, et
- * calculait `payload_len` en soustrayant les tailles d'en-têtes de
- * n_bytes sans jamais vérifier que ce résultat restait positif. Sur un
- * paquet ARP, IPv6, UDP, ICMP, ou simplement tronqué, `ip`/`tcp` pointent
- * sur des données qui ne sont pas réellement un en-tête IP/TCP, et
- * `payload_len` (de type size_t, donc non signé) peut "déborder" vers une
- * valeur énorme au lieu de devenir négative : la boucle d'affichage lit
- * alors très loin en dehors du tampon, ce qui plante le programme ou
- * affiche de la mémoire qui n'a rien à voir avec le paquet.
- *
- * @param buffer Trame brute reçue (non modifiée).
- * @param n_bytes Nombre d'octets réellement reçus (résultat de recvfrom()).
- * @param index Numéro de capture (#1, #2, ...) pour l'affichage.
+ * @brief Décode et affiche un paquet capturé (Ethernet/IP/TCP, UDP ou ICMP).
  */
-void print_packet(const uint8_t *buffer, ssize_t n_bytes, unsigned long index) {
-  if (n_bytes < 0) {
-    return; /* ne devrait pas arriver : verifie deja par l'appelant */
-  }
-  size_t n = (size_t)n_bytes;
+void print_packet(const uint8_t *buffer, size_t n_bytes, const char *pkttype) {
 
-  if (n < sizeof(struct ether_header)) {
-    printf("[#%lu] trame trop courte (%zu octets), ignoree\n", index, n);
+  static unsigned long packet_count = 0;
+  const struct ether_header *ethernet = (const struct ether_header *)buffer;
+
+  uint16_t ethertype = ntohs(ethernet->ether_type);
+
+  if (ethertype != ETH_P_IP) {
     return;
   }
 
-  const struct ether_header *ethernet = (const struct ether_header *)buffer;
-
-  printf("\n----- Paquet #%lu (%zu octets) -----\n", index, n);
-  printf("%02x:%02x:%02x:%02x:%02x:%02x -> %02x:%02x:%02x:%02x:%02x:%02x",
+  printf("\n----- %s #%lu (%zu octets) -----\n", pkttype, ++packet_count,
+         n_bytes);
+  printf("  (ethertype 0x%04x)\n", ethertype);
+  printf("%02x:%02x:%02x:%02x:%02x:%02x -> %02x:%02x:%02x:%02x:%02x:%02x\n",
          ethernet->ether_shost[0], ethernet->ether_shost[1],
          ethernet->ether_shost[2], ethernet->ether_shost[3],
          ethernet->ether_shost[4], ethernet->ether_shost[5],
@@ -224,69 +172,62 @@ void print_packet(const uint8_t *buffer, ssize_t n_bytes, unsigned long index) {
          ethernet->ether_dhost[2], ethernet->ether_dhost[3],
          ethernet->ether_dhost[4], ethernet->ether_dhost[5]);
 
-  uint16_t ethertype = ntohs(ethernet->ether_type);
-  printf("  (ethertype 0x%04x)\n", ethertype);
-
-  if (ethertype != ETH_P_IP) {
-    printf("(trame non-IPv4 : pas de decodage IP/TCP/UDP)\n");
-    return;
-  }
-
-  size_t offset = sizeof(struct ether_header);
-  if (n < offset + sizeof(struct iphdr)) {
-    printf("en-tete IP tronque, ignore\n");
-    return;
-  }
+  size_t offset = ETH_HLEN;
 
   const struct iphdr *ip = (const struct iphdr *)(buffer + offset);
   size_t ip_hlen = (size_t)ip->ihl * 4u;
-  if (ip->ihl < 5 || n < offset + ip_hlen) {
-    printf("en-tete IP invalide ou tronque, ignore\n");
-    return;
-  }
 
   char src_ip[INET_ADDRSTRLEN];
   char dst_ip[INET_ADDRSTRLEN];
-  /* inet_ntop() remplace inet_ntoa(), qui n'est pas thread-safe (elle
-   * renvoie un pointeur vers un tampon statique interne partage) : sans
-   * consequence dans ce programme mono-thread, mais inet_ntop() est la
-   * fonction moderne recommandee et evite d'y penser plus tard. */
+
   inet_ntop(AF_INET, &ip->saddr, src_ip, sizeof(src_ip));
   inet_ntop(AF_INET, &ip->daddr, dst_ip, sizeof(dst_ip));
-  printf("%s -> %s (ttl %u, protocole %u)\n", src_ip, dst_ip, ip->ttl,
-         ip->protocol);
+  printf("%s -> %s (protocole %u)\n", src_ip, dst_ip, ip->protocol);
 
   offset += ip_hlen;
   const uint8_t *payload = NULL;
   size_t payload_len = 0;
 
-  if (ip->protocol == IPPROTO_TCP && n >= offset + sizeof(struct tcphdr)) {
+  if (ip->protocol == IPPROTO_TCP) {
     const struct tcphdr *tcp = (const struct tcphdr *)(buffer + offset);
     size_t tcp_hlen = (size_t)tcp->doff * 4u;
-    if (tcp->doff < 5 || n < offset + tcp_hlen) {
-      printf("en-tete TCP invalide ou tronque, ignore\n");
-      return;
-    }
+
     printf("TCP port %u -> port %u  [%s%s%s%s%s%s]\n", ntohs(tcp->source),
            ntohs(tcp->dest), tcp->syn ? "SYN " : "", tcp->ack ? "ACK " : "",
            tcp->fin ? "FIN " : "", tcp->rst ? "RST " : "",
            tcp->psh ? "PSH " : "", tcp->urg ? "URG " : "");
     offset += tcp_hlen;
-    payload = buffer + offset;
-    payload_len = n - offset; /* sur d'etre >= 0, verifie juste au-dessus */
+    payload = (const uint8_t *)(buffer + offset);
+    payload_len = (n_bytes > offset) ? (n_bytes - offset) : 0;
 
-  } else if (ip->protocol == IPPROTO_UDP &&
-             n >= offset + sizeof(struct udphdr)) {
+  } else if (ip->protocol == IPPROTO_UDP) {
     const struct udphdr *udp = (const struct udphdr *)(buffer + offset);
     printf("UDP port %u -> port %u\n", ntohs(udp->source), ntohs(udp->dest));
     offset += sizeof(struct udphdr);
-    payload = buffer + offset;
-    payload_len = n - offset;
+    payload = (const uint8_t *)buffer + offset;
+    payload_len = (n_bytes > offset) ? (n_bytes - offset) : 0;
+
+  } else if (ip->protocol == IPPROTO_ICMP) {
+    const struct icmphdr *icmp = (const struct icmphdr *)(buffer + offset);
+
+    printf("ICMP Type %u", icmp->type);
+    if (icmp->type == ICMP_ECHO) {
+      printf(" (Echo Request / Ping Request) ID: %u, Seq: %u\n",
+             ntohs(icmp->un.echo.id), ntohs(icmp->un.echo.sequence));
+    } else if (icmp->type == ICMP_ECHOREPLY) {
+      printf(" (Echo Reply / Ping Reply) ID: %u, Seq: %u\n",
+             ntohs(icmp->un.echo.id), ntohs(icmp->un.echo.sequence));
+    } else {
+      printf(" (Code %u)\n", icmp->code);
+    }
+
+    offset += sizeof(struct icmphdr);
+    payload = (const uint8_t *)(buffer + offset);
+    payload_len = (n_bytes > offset) ? (n_bytes - offset) : 0;
 
   } else {
-    printf("protocole IP %u (ni TCP ni UDP), pas de decodage des ports\n",
+    printf("protocole IP %u (non decode), pas de decodage spécifique\n",
            ip->protocol);
-    return;
   }
 
   if (payload_len == 0) {
@@ -310,12 +251,6 @@ void print_packet(const uint8_t *buffer, ssize_t n_bytes, unsigned long index) {
     printf(" |");
     for (size_t j = 0; j < line_len; j++) {
       uint8_t c = payload[i + j];
-      /* On ne recopie jamais un octet non imprimable tel quel dans le
-       * terminal : un paquet est une donnee non fiable, et certains
-       * octets (ex: sequences d'echappement) pourraient perturber
-       * l'affichage du terminal, voire dans de rares cas y injecter des
-       * commandes. On remplace donc tout ce qui n'est pas de l'ASCII
-       * imprimable par un simple point. */
       putchar((c >= 32 && c < 127) ? (int)c : '.');
     }
     printf("|\n");
@@ -325,19 +260,6 @@ void print_packet(const uint8_t *buffer, ssize_t n_bytes, unsigned long index) {
 ///////////////////////////////// MAIN /////////////////////////////////
 /**
  * @brief Point d'entree du programme.
- *
- * Ouvre le socket promiscuous, puis entre dans la boucle principale : un
- * select() bloquant attend soit un paquet sur le socket, soit une
- * activite sur l'entree standard (si elle est un terminal). Un EOF sur
- * stdin (Ctrl+D) bascule l'etat pause/reprise ; un paquet recu est
- * affiche via print_packet() sauf en pause (mais toujours lu, pour
- * eviter que le tampon noyau du socket ne se remplisse). Ctrl+C
- * (SIGINT) fait sortir proprement de la boucle, apres quoi les drapeaux
- * de l'interface sont restaures avant fermeture du socket.
- *
- * @param argc Nombre d'arguments.
- * @param argv argv[1] doit etre le nom de l'interface a ecouter.
- * @return EXIT_SUCCESS en cas d'arret normal, EXIT_FAILURE sinon.
  */
 int main(int argc, char *argv[]) {
   if (argc != 2) {
@@ -346,115 +268,65 @@ int main(int argc, char *argv[]) {
   }
   const char *iface_name = argv[1];
 
-  signal(SIGINT, intHandler);
+  struct sigaction sa_sig;
+  memset(&sa_sig, 0, sizeof(sa_sig));
+  sa_sig.sa_handler = &intHandler;
+  sigaction(SIGINT, &sa_sig, NULL);
 
   short original_flags = 0;
   int sock = set_promiscuous_socket(iface_name, &original_flags);
-  if (sock == -1) {
-    fprintf(stderr, "Impossible d'initialiser la capture sur \"%s\"\n",
-            iface_name);
-    return EXIT_FAILURE;
-  }
 
-  /* Si l'entree standard n'est pas un terminal interactif (ex: programme
-   * lance depuis un script, une tache cron, ou avec stdin redirige
-   * depuis /dev/null), on ne la surveille pas : /dev/null est toujours
-   * "pret" en lecture et renvoie systematiquement un EOF immediat, ce
-   * qui declencherait une bascule pause/reprise en boucle serree (donc
-   * 100% d'un coeur CPU pour rien) au lieu d'attendre une vraie touche. */
-  bool stdin_is_tty = isatty(STDIN_FILENO);
-  if (!stdin_is_tty) {
-    fprintf(stderr, "(entree standard non interactive : Ctrl+D desactive, "
-                    "seul Ctrl+C fonctionnera)\n");
-  }
+  static uint8_t buffer[MAX];
 
-  static uint8_t buffer[MAX]; /* statique plutot que sur la pile de main */
-  bool paused = false;
-  unsigned long packet_count = 0;
+  print_banner();
 
-  printf("== DEBUT DE LA CAPTURE sur %s (Ctrl+C: quitter, Ctrl+D: "
-         "pause/reprise) ==\n",
-         iface_name);
+  printf("== DEBUT DE LA CAPTURE sur %s (Ctrl+C: quitter) ==\n", iface_name);
+
+  ssize_t n_bytes = 0;
+  const char *pkttype;
+  struct sockaddr_ll from;
+  socklen_t fromlen = sizeof(from);
+  memset(&from, 0, sizeof(from));
 
   while (keepRunning) {
-    fd_set rfds;
-    FD_ZERO(&rfds);
-    FD_SET(sock, &rfds);
-    int maxfd = sock;
-    if (stdin_is_tty) {
-      FD_SET(STDIN_FILENO, &rfds);
-      if (STDIN_FILENO > maxfd)
-        maxfd = STDIN_FILENO;
-    }
+    n_bytes =
+        recvfrom(sock, buffer, MAX, 0, (struct sockaddr *)&from, &fromlen);
 
-    int ready = select(maxfd + 1, &rfds, NULL, NULL, NULL);
-    if (ready == -1) {
-      if (errno == EINTR)
-        continue; /* interrompu par SIGINT : keepRunning va etre a 0 */
-      perror("select");
+    if (n_bytes == -1) {
+      /* Si c'est un timeout ou un signal, on boucle pour verifier keepRunning
+       */
+      if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) {
+        continue;
+      }
+      perror("recvfrom");
       break;
     }
 
-    if (stdin_is_tty && FD_ISSET(STDIN_FILENO, &rfds)) {
-      char discard[256];
-      ssize_t r = read(STDIN_FILENO, discard, sizeof(discard));
-      if (r == 0) {
-        /* EOF sur le terminal : Ctrl+D tape sur une ligne vide. */
-        paused = !paused;
-        printf(paused ? "\n== PAUSE (Ctrl+D pour reprendre) ==\n"
-                      : "\n== REPRISE DE LA CAPTURE ==\n");
-        fflush(stdout);
-      }
-      /* r > 0 : l'utilisateur a tape une ligne puis Entree ; on l'ignore,
-       * ce programme n'a pas de commandes textuelles. */
+    switch (from.sll_pkttype) {
+    case PACKET_HOST:
+      pkttype = "PACKET_HOST";
+      break;
+    case PACKET_OUTGOING:
+      pkttype = "SORTANT";
+      break;
+    case PACKET_BROADCAST:
+      pkttype = "PACKET_BROADCAST";
+      break;
+    case PACKET_MULTICAST:
+      pkttype = "ENTRANT (multicast)";
+      break;
+    case PACKET_OTHERHOST:
+      pkttype = "PACKET_OTHERHOST";
+      break;
+    default:
+      pkttype = "PACKET_UNKNOW";
+      break;
     }
 
-    if (FD_ISSET(sock, &rfds)) {
-      struct sockaddr_ll from;
-      socklen_t fromlen = sizeof(from);
-      memset(&from, 0, sizeof(from));
-
-      ssize_t n_bytes =
-          recvfrom(sock, buffer, MAX, 0, (struct sockaddr *)&from, &fromlen);
-      if (n_bytes == -1) {
-        if (errno == EINTR)
-          continue;
-        perror("recvfrom");
-        break;
-      }
-
-      if (!paused) {
-        packet_count++;
-
-        const char *direction;
-        switch (from.sll_pkttype) {
-        case PACKET_HOST:
-          direction = "ENTRANT (pour nous)";
-          break;
-        case PACKET_OUTGOING:
-          direction = "SORTANT";
-          break;
-        case PACKET_BROADCAST:
-          direction = "ENTRANT (broadcast)";
-          break;
-        case PACKET_MULTICAST:
-          direction = "ENTRANT (multicast)";
-          break;
-        case PACKET_OTHERHOST:
-          direction = "ENTRANT (pour un autre hote)";
-          break;
-        default:
-          direction = "direction inconnue";
-          break;
-        }
-        printf("[#%lu] %s\n", packet_count, direction);
-
-        print_packet(buffer, n_bytes, packet_count);
-      }
-    }
+    print_packet(buffer, (size_t)n_bytes, pkttype);
   }
 
-  printf("\n== FIN DE LA CAPTURE (%lu paquets affiches) ==\n", packet_count);
+  printf("\n== FIN DE LA CAPTURE ==\n");
 
   restore_interface_flags(sock, iface_name, original_flags);
   ERROR_CHECK(close(sock));
