@@ -41,9 +41,10 @@ struct arp_header {
 
 #define CHECK(op)                                                              \
   do {                                                                         \
-    if (op == -1)                                                              \
+    if (op == -1) {                                                            \
       perror(#op);                                                             \
-    exit(EXIT_FAILURE);                                                        \
+      exit(EXIT_FAILURE);                                                      \
+    }                                                                          \
   } while (0)
 
 void arp_broadast_discovry_buidl(uint8_t *frame, struct ifreq *ifr, int fd) {
@@ -69,14 +70,77 @@ void arp_broadast_discovry_buidl(uint8_t *frame, struct ifreq *ifr, int fd) {
          sizeof(ip_sender.s_addr));
   memset(a_header->target_ethernet_addr, 0x00, 6);
 
+  uint8_t *first = (uint8_t *)&(ip_sender.s_addr);
+  printf("first : %d\n", *first);
+
+  /* --- AJOUT : Récupération et affichage du Netmask --- */
+  struct ifreq ifr_mask;
+  strncpy(ifr_mask.ifr_name, ifr->ifr_name, IFNAMSIZ - 1);
+  CHECK(ioctl(fd, SIOCGIFNETMASK, &ifr_mask));
+  struct in_addr netmask =
+      ((struct sockaddr_in *)&ifr_mask.ifr_netmask)->sin_addr;
+
+  char mask_str[INET_ADDRSTRLEN];
+  inet_ntop(AF_INET, &netmask, mask_str, sizeof(mask_str));
+
   uint32_t base_ip = ntohl(ip_sender.s_addr) & 0xFFFFFF00;
+  printf("ARP BROADCAST ON : %u.%u.%u.%u (Mask: %s)\n",
+         *((uint8_t *)(&base_ip) + 3), *((uint8_t *)(&base_ip) + 2),
+         *((uint8_t *)(&base_ip) + 1), *((uint8_t *)&base_ip), mask_str);
+
+  /* --- Préparation de la structure d'adresse d'envoi --- */
+  struct sockaddr_ll sa;
+  memset(&sa, 0x00, sizeof(sa));
+  sa.sll_family = AF_PACKET;
+  sa.sll_protocol = htons(ETH_P_ARP);
+  sa.sll_ifindex = ifr->ifr_ifindex;
+  sa.sll_halen = 6;
+  memset(sa.sll_addr, 0xFF, 6);
+
+  /* Boucle inchangée : Décommentée et activée pour l'envoi */
   for (uint8_t i = 1; i < 255; i++) {
     uint32_t ip_target = htonl(base_ip | i);
     if (ip_target == ip_sender.s_addr) {
       continue;
     }
     memcpy(&(a_header->target_ip_addr), &ip_target, sizeof(ip_target));
-    CHECK(sendto(fd, frame, FRAME_LEN, 0, NULL, NULL));
+    CHECK(sendto(fd, frame, FRAME_LEN, 0, (struct sockaddr *)&sa, sizeof(sa)));
+  }
+}
+
+/* --- NOUVELLE FONCTION : Écoute des réponses --- */
+void arp_listen_responses(int fd) {
+  // Configuration d'un Timeout d'1.5s pour sortir de l'écoute automatiquement
+  struct timeval tv = {.tv_sec = 1, .tv_usec = 500000};
+  CHECK(setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)));
+
+  printf("\n[+] Attente des réponses ARP...\n");
+  uint8_t recv_buf[1500];
+
+  while (1) {
+    ssize_t len = recvfrom(fd, recv_buf, sizeof(recv_buf), 0, NULL, NULL);
+    if (len < 0)
+      break; // Timeout écoulé, fin du balayage
+
+    if (len < (ssize_t)FRAME_LEN)
+      continue;
+
+    ethernet_header *eth = (ethernet_header *)recv_buf;
+    arp_header *arp = (arp_header *)(recv_buf + sizeof(ethernet_header));
+
+    // Filtrage des paquets : ARP (0x0806) + Opération REPLY (0x0002)
+    if (ntohs(eth->frame_type) == ETHERTYPE_ARP &&
+        ntohs(arp->operation) == ARPOP_REPLY) {
+      char ip_str[INET_ADDRSTRLEN];
+      struct in_addr addr = {.s_addr = arp->sender_ip_addr};
+      inet_ntop(AF_INET, &addr, ip_str, sizeof(ip_str));
+
+      printf("  [->] Hôte trouvé : IP = %-15s | MAC = "
+             "%02X:%02X:%02X:%02X:%02X:%02X\n",
+             ip_str, arp->sender_ethernet_addr[0], arp->sender_ethernet_addr[1],
+             arp->sender_ethernet_addr[2], arp->sender_ethernet_addr[3],
+             arp->sender_ethernet_addr[4], arp->sender_ethernet_addr[5]);
+    }
   }
 }
 
@@ -86,7 +150,7 @@ int main(void) {
   CHECK((fd = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ARP))));
 
   struct ifreq ifr;
-  memset(&ifr, 0, sizeof(ifr));
+  memset(&ifr, 0x00, sizeof(ifr));
   strncpy(ifr.ifr_name, "wlan0", IFNAMSIZ - 1);
 
   CHECK(ioctl(fd, SIOCGIFINDEX, &ifr));
@@ -103,6 +167,7 @@ int main(void) {
   memset(frame, 0x00, sizeof(frame));
 
   arp_broadast_discovry_buidl(frame, &ifr, fd);
+  arp_listen_responses(fd); // Appel de l'écoute juste après l'envoi
 
   CHECK(close(fd));
   return EXIT_SUCCESS;
